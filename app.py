@@ -6,7 +6,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 
 from utils.browsing import browse
 from utils.mail import MailError, send_mail
-from utils.streaming import StreamingError, events_since, serve_file, start_stream
+from utils.streaming import StreamingError, events_since, record_teardown, serve_file, start_stream
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
@@ -64,6 +64,12 @@ def stream_api():
         return jsonify(start_stream(payload.get("quality", "auto")))
     except StreamingError as exc:
         return error_response(str(exc), 503)
+
+
+@app.post("/api/stream/stop")
+def stream_stop_api():
+    record_teardown()
+    return jsonify({"success": True})
 
 
 @app.get("/stream/<path:filename>")
