@@ -99,56 +99,7 @@ def browse(url: str) -> dict:
     events = []
     seq = 1
 
-    # --- 1. DNS Resolution (Application: DNS, Transport: UDP) ---
-    events.append(event(
-        seq, "UDP", "client-to-server", "datagram",
-        "Client → Resolver",
-        {
-            "Src": "53124",
-            "Dst": "53",
-            "Length": "39",
-        },
-        delay=600,
-        layer="transport",
-    ))
-    seq += 1
-
-    events.append(event(
-        seq, "DNS", "client-to-server", "query",
-        f"A {hostname}",
-        {
-            "Name": hostname,
-        },
-        delay=600,
-        layer="application",
-    ))
-    seq += 1
-
-    events.append(event(
-        seq, "UDP", "server-to-client", "datagram",
-        "Resolver → Client",
-        {
-            "Src": "53",
-            "Dst": "53124",
-            "Length": "75",
-        },
-        delay=600,
-        layer="transport",
-    ))
-    seq += 1
-
-    events.append(event(
-        seq, "DNS", "server-to-client", "response",
-        "NOERROR",
-        {
-            "Answer": ", ".join(addresses),
-        },
-        delay=600,
-        layer="application",
-    ))
-    seq += 1
-
-    # --- 2. TCP Three-Way Handshake (Transport: TCP) ---
+    # --- 1. TCP Three-Way Handshake ---
     events.append(event(
         seq, "TCP", "client-to-server", "syn",
         "Client → Server",
@@ -158,7 +109,7 @@ def browse(url: str) -> dict:
             "Dst": str(target_port),
             "Window": "65535",
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
     seq += 1
@@ -173,7 +124,7 @@ def browse(url: str) -> dict:
             "Dst": str(client_port),
             "Window": "65535",
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
     seq += 1
@@ -188,23 +139,12 @@ def browse(url: str) -> dict:
             "Dst": str(target_port),
             "State": "ESTABLISHED",
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
     seq += 1
 
-    # --- 3. TLS Handshake (if HTTPS) ---
-    if scheme == "HTTPS":
-        events.append(event(
-            seq, "TLS", "client-to-server", "handshake",
-            "TLS Handshake",
-            {},
-            delay=700,
-            layer="application",
-        ))
-        seq += 1
-
-    # --- 4. Live HTTP Request Execution ---
+    # --- 2. Live HTTP Request Execution ---
     request_headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     http_request = Request(normalized_url, headers=request_headers, method="GET")
     raw_req_preview = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\n\r\n"
@@ -243,19 +183,19 @@ def browse(url: str) -> dict:
 
     request_protocol = "HTTPS" if scheme == "HTTPS" else "HTTP"
 
-    # --- 5. Application Layer: HTTP Request ---
+    # --- 3. Application Layer: HTTP Request ---
     events.append(event(
         seq, request_protocol, "client-to-server", "request",
         f"GET {path} HTTP/1.1",
         {
             "Host": hostname,
         },
-        delay=700,
+        delay=650,
         layer="application",
     ))
     seq += 1
 
-    # --- 6. Transport Layer: TCP Data Segment (HTTP Request) ---
+    # --- 4. Transport Layer: TCP Data Segment (HTTP Request) ---
     events.append(event(
         seq, "TCP", "client-to-server", "psh",
         "Client → Server",
@@ -266,11 +206,12 @@ def browse(url: str) -> dict:
             "Dst": str(target_port),
             "Length": str(req_payload_len),
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
     seq += 1
 
+    # --- 5. Transport Layer: Server ACK of Request ---
     events.append(event(
         seq, "TCP", "server-to-client", "ack",
         "Server → Client",
@@ -280,12 +221,22 @@ def browse(url: str) -> dict:
             "Src": str(target_port),
             "Dst": str(client_port),
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
     seq += 1
 
-    # --- 7. Transport Layer: TCP Data Segment (HTTP Response) ---
+    # --- 6. Application Layer: HTTP Response ---
+    events.append(event(
+        seq, request_protocol, "server-to-client", "response",
+        f"HTTP/1.1 {status} {reason}".strip(),
+        response_fields,
+        delay=650,
+        layer="application",
+    ))
+    seq += 1
+
+    # --- 7. Transport Layer: TCP Data Segment (HTTP Response Payload) ---
     resp_bytes = len(body)
     events.append(event(
         seq, "TCP", "server-to-client", "psh",
@@ -297,22 +248,12 @@ def browse(url: str) -> dict:
             "Dst": str(client_port),
             "Length": str(resp_bytes),
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
     seq += 1
 
-    # --- 8. Application Layer: HTTP Response ---
-    events.append(event(
-        seq, request_protocol, "server-to-client", "response",
-        f"HTTP/1.1 {status} {reason}".strip(),
-        response_fields,
-        delay=700,
-        layer="application",
-    ))
-    seq += 1
-
-    # --- 9. Transport Layer: Client ACK for response data ---
+    # --- 8. Transport Layer: Client ACK for response data ---
     events.append(event(
         seq, "TCP", "client-to-server", "ack",
         "Client → Server",
@@ -322,40 +263,83 @@ def browse(url: str) -> dict:
             "Src": str(client_port),
             "Dst": str(target_port),
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
     seq += 1
 
-    # --- 10. Transport Layer: TCP Connection Teardown ---
+    # --- 9. Transport Layer: Four-Part TCP Teardown ---
+    x = 1 + req_payload_len
+    y = 1 + resp_bytes
+
+    # Step 1: Client FIN, ACK (Seq = X, Ack = Y)
     events.append(event(
         seq, "TCP", "client-to-server", "fin-ack",
         "Client → Server",
         {
-            "Seq": str(1 + req_payload_len),
-            "Ack": str(1 + resp_bytes),
+            "Seq": str(x),
+            "Ack": str(y),
             "Src": str(client_port),
             "Dst": str(target_port),
             "State": "FIN_WAIT_1",
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
     seq += 1
 
+    # Step 2: Server ACK (Seq = Y, Ack = X+1)
     events.append(event(
         seq, "TCP", "server-to-client", "ack",
         "Server → Client",
         {
-            "Seq": str(1 + resp_bytes),
-            "Ack": str(2 + req_payload_len),
+            "Seq": str(y),
+            "Ack": str(x + 1),
             "Src": str(target_port),
             "Dst": str(client_port),
-            "State": "CLOSED",
+            "State": "CLOSE_WAIT",
         },
-        delay=650,
+        delay=600,
         layer="transport",
     ))
+    seq += 1
 
-    return {"success": True, "activity": "browsing", "events": events}
+    # Step 3: Server FIN, ACK (Seq = Y, Ack = X+1)
+    events.append(event(
+        seq, "TCP", "server-to-client", "fin-ack",
+        "Server → Client",
+        {
+            "Seq": str(y),
+            "Ack": str(x + 1),
+            "Src": str(target_port),
+            "Dst": str(client_port),
+            "State": "LAST_ACK",
+        },
+        delay=600,
+        layer="transport",
+    ))
+    seq += 1
+
+    # Step 4: Client ACK (Seq = X+1, Ack = Y+1)
+    events.append(event(
+        seq, "TCP", "client-to-server", "ack",
+        "Client → Server",
+        {
+            "Seq": str(x + 1),
+            "Ack": str(y + 1),
+            "Src": str(client_port),
+            "Dst": str(target_port),
+            "State": "TIME_WAIT",
+        },
+        delay=600,
+        layer="transport",
+    ))
+    seq += 1
+
+    return {
+        "success": True,
+        "activity": "browsing",
+        "server": target_dest,
+        "events": events,
+    }
 
