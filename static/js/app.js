@@ -22,23 +22,44 @@ function setStatus(message, active = false) {
   $(".status-dot").classList.toggle("is-active", active);
 }
 function showError(message = "") { const box = $("#error"); box.textContent = message; box.hidden = !message; }
-function messageLabel(item) { const labels = { query: "Query", response: "Response", request: "Request", command: "Command", data: "Message data", connect: "Connection", handshake: "TLS handshake", note: "Encrypted data" }; return labels[item.type] || item.type; }
+function messageLabel(item) {
+  const labels = {
+    query: "DNS Query",
+    response: "Response",
+    request: "Request",
+    command: "Command",
+    data: "Message data",
+    connect: "Connection",
+    handshake: "TLS handshake",
+    note: "Encrypted data",
+    syn: "SYN (Handshake)",
+    "syn-ack": "SYN-ACK",
+    ack: "ACK",
+    psh: "PSH-ACK (Data Segment)",
+    "fin-ack": "FIN-ACK (Close)",
+    datagram: "UDP Datagram",
+  };
+  return labels[item.type] || item.type;
+}
+
 function displayMessage(item) {
   if (item.protocol === "DNS" && item.type === "query") return `A ${item.fields?.Name || "hostname"}`;
   if (item.protocol === "DNS" && item.type === "response") return "NOERROR";
   return item.message;
 }
+
 function visibleFields(item) {
   const allowed = {
-    DNS: item.type === "query" ? [] : ["Answer"],
+    DNS: item.type === "query" ? ["Name", "Type"] : ["Answer", "Resolver", "Status"],
     HTTP: item.type === "request" ? ["Host"] : ["Content-Type", "Content-Length", "Server", "Location"],
     HTTPS: item.type === "request" ? ["Host"] : ["Content-Type", "Content-Length", "Server", "Location"],
     SMTP: item.type === "response" ? ["Capabilities"] : [],
     MANIFEST: ["Representation", "Resource"],
     SEGMENT: ["Representation", "Resource"],
-    TCP: ["Destination"],
-    TLS: ["Visibility"],
-    HLS: item.type === "response" ? ["Content-Type"] : [],
+    TCP: ["Destination", "Flags", "Source Port", "Destination Port", "Sequence Number", "Acknowledgment Number", "Payload Length", "Window Size", "State", "Segment", "Description"],
+    UDP: ["Source Port", "Destination Port", "Length", "Checksum", "Description"],
+    TLS: ["Visibility", "Transport"],
+    HLS: item.type === "response" ? ["Content-Type", "Size"] : ["Resource"],
   };
   const keys = allowed[item.protocol] || [];
   return Object.entries(item.fields || {}).filter(([key]) => keys.includes(key)).map(([key, value]) => {
@@ -47,30 +68,87 @@ function visibleFields(item) {
     return [key, value];
   });
 }
+
 function smtpInteractionGroups(items) {
   const groups = [];
   let current = null;
   items.forEach(({ item, index }) => {
     if (item.direction === "server-to-client" && !groups.length && !current) {
-      groups.push({ key: "SMTP / SERVER GREETING", items: [{ item, index }] });
+      groups.push({ key: "SMTP / SERVER GREETING", layer: "application", protocol: "SMTP", items: [{ item, index }] });
       return;
     }
     if (item.direction === "client-to-server" && !(item.type === "data" && current?.key === "SMTP / DATA")) {
       const command = item.type === "data" ? "MESSAGE DATA" : item.message.split(" ", 1)[0].toUpperCase();
       const title = command === "EHLO" && groups.some((group) => group.key === "SMTP / EHLO") ? "EHLO (AFTER TLS)" : command;
-      current = { key: `SMTP / ${title}`, items: [] };
+      current = { key: `SMTP / ${title}`, layer: "application", protocol: "SMTP", items: [] };
       groups.push(current);
     }
     if (current) current.items.push({ item, index });
   });
   return groups;
 }
+
+function groupKeyFor(item) {
+  if (item.protocol === "TCP") {
+    if (item.type === "syn" || item.type === "syn-ack" || (item.type === "ack" && item.fields?.State === "ESTABLISHED")) {
+      return "TCP / THREE-WAY HANDSHAKE";
+    }
+    if (item.type === "fin-ack" || (item.type === "ack" && (item.fields?.State?.includes("CLOSE") || item.fields?.State?.includes("CLOSED")))) {
+      return "TCP / CONNECTION TEARDOWN";
+    }
+    return "TCP / DATA TRANSFER";
+  }
+  if (item.protocol === "UDP") {
+    return "UDP / DATAGRAM TRANSPORT";
+  }
+  if (item.protocol === "DNS") {
+    return "DNS / RESOLUTION";
+  }
+  if (item.protocol === "TLS") {
+    return "TLS / SECURITY HANDSHAKE";
+  }
+  return item.protocol;
+}
+
 function renderExchange() {
   const view = $("#exchange-view"); view.replaceChildren();
   if (!state.events.length) { view.innerHTML = '<p class="empty-state">Run an activity to populate the exchange.</p>'; return; }
   const groups = [];
-  state.events.forEach((item, index) => { const key = item.protocol; let group = groups[groups.length - 1]; if (!group || group.key !== key) { group = { key, items: [] }; groups.push(group); } group.items.push({ item, index }); });
-  groups.flatMap((group) => group.key === "SMTP" ? smtpInteractionGroups(group.items) : [group]).forEach((group) => { const section = document.createElement("section"); section.className = `exchange-group${group.key.startsWith("SMTP /") ? " smtp-interaction" : ""}`; const resolver = group.key === "DNS" ? group.items[0].item.fields?.Resolver : ""; const context = resolver ? `<p class="exchange-context">Client → ${escapeHtml(resolver)}</p>` : ""; section.innerHTML = `<h3 class="exchange-group-title">${escapeHtml(group.key)}</h3>${context}`; const list = document.createElement("div"); list.className = "exchange-events"; group.items.forEach(({ item, index }) => { const message = document.createElement("article"); message.className = `exchange-message ${index === state.current ? "is-current" : index < state.current ? "is-complete" : ""}`; const fields = visibleFields(item).map(([key, value]) => `<span class="field"><b>${escapeHtml(key)}:</b> ${escapeHtml(String(value))}</span>`).join(""); message.innerHTML = `<div class="message-side"><span class="message-kind">${escapeHtml(messageLabel(item))}</span><strong>${escapeHtml(displayMessage(item))}</strong>${fields ? `<div class="message-fields">${fields}</div>` : ""}</div>`; list.append(message); }); section.append(list); view.append(section); });
+  state.events.forEach((item, index) => {
+    const key = groupKeyFor(item);
+    const layer = item.layer || (item.protocol === "TCP" || item.protocol === "UDP" ? "transport" : "application");
+    let group = groups[groups.length - 1];
+    if (!group || group.key !== key) {
+      group = { key, layer, protocol: item.protocol, items: [] };
+      groups.push(group);
+    }
+    group.items.push({ item, index });
+  });
+
+  const partitionedGroups = groups.flatMap((group) => {
+    if (group.protocol === "SMTP") return smtpInteractionGroups(group.items);
+    return [group];
+  });
+
+  partitionedGroups.forEach((group) => {
+    const section = document.createElement("section");
+    section.className = `exchange-group${group.key.startsWith("SMTP /") || group.key.startsWith("TCP /") || group.key.startsWith("UDP /") ? " smtp-interaction" : ""}`;
+    const resolver = group.protocol === "DNS" ? group.items[0]?.item.fields?.Resolver : "";
+    const context = resolver ? `<p class="exchange-context">Client → ${escapeHtml(resolver)}</p>` : "";
+    const layerTag = group.layer === "transport" ? "Transport Layer (L4)" : "Application Layer (L7)";
+    section.innerHTML = `<span class="eyebrow">${escapeHtml(layerTag)}</span><h3 class="exchange-group-title">${escapeHtml(group.key)}</h3>${context}`;
+    const list = document.createElement("div");
+    list.className = "exchange-events";
+    group.items.forEach(({ item, index }) => {
+      const message = document.createElement("article");
+      message.className = `exchange-message ${index === state.current ? "is-current" : index < state.current ? "is-complete" : ""}`;
+      const fields = visibleFields(item).map(([key, value]) => `<span class="field"><b>${escapeHtml(key)}:</b> ${escapeHtml(String(value))}</span>`).join("");
+      message.innerHTML = `<div class="message-side"><span class="message-kind">${escapeHtml(messageLabel(item))}</span><strong>${escapeHtml(displayMessage(item))}</strong>${fields ? `<div class="message-fields">${fields}</div>` : ""}</div>`;
+      list.append(message);
+    });
+    section.append(list);
+    view.append(section);
+  });
   const current = view.querySelector(".is-current"); if (current) current.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 function showEvent(index) { if (!state.events.length) return; state.current = Math.max(0, Math.min(index, state.events.length - 1)); renderExchange(); scheduleNext(); }

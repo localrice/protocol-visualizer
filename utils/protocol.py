@@ -6,10 +6,14 @@ from datetime import datetime, timezone
 
 
 def event(sequence: int, protocol: str, direction: str, event_type: str,
-          message: str, fields: dict[str, str], delay: int = 800) -> dict:
+          message: str, fields: dict[str, str], delay: int = 800,
+          layer: str | None = None) -> dict:
+    if layer is None:
+        layer = "transport" if protocol in {"TCP", "UDP"} else "application"
     return {
         "sequence": sequence,
         "protocol": protocol,
+        "layer": layer,
         "direction": direction,
         "type": event_type,
         "message": message,

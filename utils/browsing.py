@@ -92,29 +92,145 @@ def browse(url: str) -> dict:
     normalized_url, hostname, path = validate_url(url)
     addresses = resolve_public_host(hostname)
     scheme = urlparse(normalized_url).scheme.upper()
-    events = [
-        event(1, "DNS", "client-to-server", "query", f"DNS Query: A {hostname}", {
-            "Name": hostname, "Type": "A / AAAA", "Resolver": f"Recursive Resolver {DNS_RESOLVER}:53"
-        }),
-        event(2, "DNS", "server-to-client", "response", "DNS Response: NOERROR", {
-            "Resolver": f"Recursive Resolver {DNS_RESOLVER}:53", "Answer": ", ".join(addresses), "Status": "resolved"
-        }),
-    ]
+    target_port = 443 if scheme == "HTTPS" else 80
+    client_port = 52418
+    target_dest = f"{hostname}:{target_port}"
 
-    next_sequence = 3
+    events = []
+    seq = 1
+
+    # --- 1. DNS Resolution (Application: DNS, Transport: UDP) ---
+    events.append(event(
+        seq, "UDP", "client-to-server", "datagram",
+        f"Datagram: Client → Resolver {DNS_RESOLVER}:53 [UDP] Len=39",
+        {
+            "Transport": "UDP",
+            "Source Port": "53124",
+            "Destination Port": "53",
+            "Length": "39 bytes",
+            "Description": f"UDP datagram transmitting DNS query for {hostname}",
+        },
+        delay=600,
+        layer="transport",
+    ))
+    seq += 1
+
+    events.append(event(
+        seq, "DNS", "client-to-server", "query",
+        f"DNS Query: A {hostname}",
+        {
+            "Name": hostname,
+            "Type": "A / AAAA",
+            "Resolver": f"Recursive Resolver {DNS_RESOLVER}:53",
+        },
+        delay=600,
+        layer="application",
+    ))
+    seq += 1
+
+    events.append(event(
+        seq, "UDP", "server-to-client", "datagram",
+        f"Datagram: Resolver {DNS_RESOLVER}:53 → Client [UDP] Len=75",
+        {
+            "Transport": "UDP",
+            "Source Port": "53",
+            "Destination Port": "53124",
+            "Length": "75 bytes",
+            "Description": "UDP datagram carrying DNS resolution response",
+        },
+        delay=600,
+        layer="transport",
+    ))
+    seq += 1
+
+    events.append(event(
+        seq, "DNS", "server-to-client", "response",
+        "DNS Response: NOERROR",
+        {
+            "Resolver": f"Recursive Resolver {DNS_RESOLVER}:53",
+            "Answer": ", ".join(addresses),
+            "Status": "resolved",
+        },
+        delay=600,
+        layer="application",
+    ))
+    seq += 1
+
+    # --- 2. TCP Three-Way Handshake (Transport: TCP) ---
+    events.append(event(
+        seq, "TCP", "client-to-server", "syn",
+        f"Client → Server [SYN] Seq=0 Win=65535 Len=0 ({target_dest})",
+        {
+            "Transport": "TCP",
+            "Flags": "SYN",
+            "Source Port": str(client_port),
+            "Destination Port": str(target_port),
+            "Sequence Number": "0 (Relative)",
+            "Acknowledgment Number": "0",
+            "Window Size": "65535",
+            "Description": f"TCP connection establishment: Client initiates 3-way handshake to {target_dest}",
+        },
+        delay=650,
+        layer="transport",
+    ))
+    seq += 1
+
+    events.append(event(
+        seq, "TCP", "server-to-client", "syn-ack",
+        f"Server → Client [SYN, ACK] Seq=0 Ack=1 Win=65535 Len=0",
+        {
+            "Transport": "TCP",
+            "Flags": "SYN, ACK",
+            "Source Port": str(target_port),
+            "Destination Port": str(client_port),
+            "Sequence Number": "0 (Relative)",
+            "Acknowledgment Number": "1 (Acknowledges Client SYN)",
+            "Window Size": "65535",
+            "Description": "Server confirms connection request with SYN-ACK",
+        },
+        delay=650,
+        layer="transport",
+    ))
+    seq += 1
+
+    events.append(event(
+        seq, "TCP", "client-to-server", "ack",
+        f"Client → Server [ACK] Seq=1 Ack=1 Win=65535 Len=0",
+        {
+            "Transport": "TCP",
+            "Flags": "ACK",
+            "Source Port": str(client_port),
+            "Destination Port": str(target_port),
+            "Sequence Number": "1",
+            "Acknowledgment Number": "1",
+            "State": "ESTABLISHED",
+            "Description": "Three-way handshake complete; TCP connection established",
+        },
+        delay=650,
+        layer="transport",
+    ))
+    seq += 1
+
+    # --- 3. TLS Handshake (if HTTPS) ---
     if scheme == "HTTPS":
-        events.extend([
-            event(next_sequence, "TCP", "client-to-server", "connect", "TCP connection established", {
-                "Destination": f"{hostname}:443", "Transport": "TCP"
-            }),
-            event(next_sequence + 1, "TLS", "client-to-server", "handshake", "TLS handshake", {
-                "Visibility": "Encrypted application data follows; no plaintext wire capture.", "Transport": "HTTPS"
-            }),
-        ])
-        next_sequence += 2
+        events.append(event(
+            seq, "TLS", "client-to-server", "handshake",
+            "TLS handshake",
+            {
+                "Visibility": "Encrypted application data follows; no plaintext wire capture.",
+                "Transport": f"HTTPS (TCP/{target_port})",
+            },
+            delay=700,
+            layer="application",
+        ))
+        seq += 1
 
+    # --- 4. Live HTTP Request Execution ---
     request_headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     http_request = Request(normalized_url, headers=request_headers, method="GET")
+    raw_req_preview = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\n\r\n"
+    req_payload_len = len(raw_req_preview.encode("utf-8"))
+
     started = time.monotonic()
     try:
         opener = build_opener(NoRedirectHandler())
@@ -154,13 +270,140 @@ def browse(url: str) -> dict:
         response_fields["Body"] = f"truncated at {MAX_BODY_BYTES} bytes"
 
     request_protocol = "HTTPS" if scheme == "HTTPS" else "HTTP"
-    events.append(event(next_sequence, request_protocol, "client-to-server", "request", f"GET {path} HTTP/1.1", {
-        "Host": hostname,
-        "User-Agent": USER_AGENT,
-        "Accept": "*/*",
-        "Target": final_url,
-        "Capture": "Request metadata from the HTTP client",
-    }))
-    events.append(event(next_sequence + 1, request_protocol, "server-to-client", "response", f"HTTP/1.1 {status} {reason}".strip(), response_fields))
+
+    # --- 5. Application Layer: HTTP Request ---
+    events.append(event(
+        seq, request_protocol, "client-to-server", "request",
+        f"GET {path} HTTP/1.1",
+        {
+            "Host": hostname,
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+            "Target": final_url,
+            "Capture": "Request metadata from the HTTP client",
+        },
+        delay=700,
+        layer="application",
+    ))
+    seq += 1
+
+    # --- 6. Transport Layer: TCP Data Segment (HTTP Request) ---
+    events.append(event(
+        seq, "TCP", "client-to-server", "psh",
+        f"Client → Server [PSH, ACK] Seq=1 Ack=1 Len={req_payload_len}",
+        {
+            "Transport": "TCP",
+            "Flags": "PSH, ACK",
+            "Source Port": str(client_port),
+            "Destination Port": str(target_port),
+            "Sequence Number": "1",
+            "Acknowledgment Number": "1",
+            "Payload Length": f"{req_payload_len} bytes",
+            "Segment": f"Carrying HTTP request payload (GET {path})",
+            "Description": "TCP segment pushes HTTP request to server socket",
+        },
+        delay=650,
+        layer="transport",
+    ))
+    seq += 1
+
+    events.append(event(
+        seq, "TCP", "server-to-client", "ack",
+        f"Server → Client [ACK] Seq=1 Ack={1 + req_payload_len} Win=65535 Len=0",
+        {
+            "Transport": "TCP",
+            "Flags": "ACK",
+            "Source Port": str(target_port),
+            "Destination Port": str(client_port),
+            "Sequence Number": "1",
+            "Acknowledgment Number": str(1 + req_payload_len),
+            "Description": "Server acknowledges receipt of HTTP request data bytes",
+        },
+        delay=650,
+        layer="transport",
+    ))
+    seq += 1
+
+    # --- 7. Transport Layer: TCP Data Segment (HTTP Response) ---
+    resp_bytes = len(body)
+    events.append(event(
+        seq, "TCP", "server-to-client", "psh",
+        f"Server → Client [PSH, ACK] Seq=1 Ack={1 + req_payload_len} Len={resp_bytes}",
+        {
+            "Transport": "TCP",
+            "Flags": "PSH, ACK",
+            "Source Port": str(target_port),
+            "Destination Port": str(client_port),
+            "Sequence Number": "1",
+            "Acknowledgment Number": str(1 + req_payload_len),
+            "Payload Length": f"{resp_bytes} bytes",
+            "Segment": f"Carrying HTTP response payload ({status} {reason})",
+            "Description": "Server returns HTTP response payload across TCP stream",
+        },
+        delay=650,
+        layer="transport",
+    ))
+    seq += 1
+
+    # --- 8. Application Layer: HTTP Response ---
+    events.append(event(
+        seq, request_protocol, "server-to-client", "response",
+        f"HTTP/1.1 {status} {reason}".strip(),
+        response_fields,
+        delay=700,
+        layer="application",
+    ))
+    seq += 1
+
+    # --- 9. Transport Layer: Client ACK for response data ---
+    events.append(event(
+        seq, "TCP", "client-to-server", "ack",
+        f"Client → Server [ACK] Seq={1 + req_payload_len} Ack={1 + resp_bytes} Win=65535 Len=0",
+        {
+            "Transport": "TCP",
+            "Flags": "ACK",
+            "Source Port": str(client_port),
+            "Destination Port": str(target_port),
+            "Sequence Number": str(1 + req_payload_len),
+            "Acknowledgment Number": str(1 + resp_bytes),
+            "Description": "Client acknowledges receipt of HTTP response bytes",
+        },
+        delay=650,
+        layer="transport",
+    ))
+    seq += 1
+
+    # --- 10. Transport Layer: TCP Connection Teardown ---
+    events.append(event(
+        seq, "TCP", "client-to-server", "fin-ack",
+        f"Client → Server [FIN, ACK] Seq={1 + req_payload_len} Ack={1 + resp_bytes} Len=0",
+        {
+            "Transport": "TCP",
+            "Flags": "FIN, ACK",
+            "Source Port": str(client_port),
+            "Destination Port": str(target_port),
+            "State": "FIN_WAIT_1",
+            "Description": "Client initiates graceful TCP connection teardown",
+        },
+        delay=650,
+        layer="transport",
+    ))
+    seq += 1
+
+    events.append(event(
+        seq, "TCP", "server-to-client", "ack",
+        f"Server → Client [ACK] Seq={1 + resp_bytes} Ack={2 + req_payload_len} Win=65535 Len=0",
+        {
+            "Transport": "TCP",
+            "Flags": "ACK",
+            "Source Port": str(target_port),
+            "Destination Port": str(client_port),
+            "State": "CLOSE_WAIT / FIN_WAIT_2",
+            "Description": "Server acknowledges connection teardown",
+        },
+        delay=650,
+        layer="transport",
+    ))
 
     return {"success": True, "activity": "browsing", "events": events}
+

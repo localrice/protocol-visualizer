@@ -1,12 +1,12 @@
 # Protocol Visualizer
 
-A web application that demonstrates network protocols in action—performing live DNS resolution and HTTP/HTTPS browsing, real-time HLS video streaming, and a simulated SMTP email protocol exchange based on an actual session captured during development.
+A web application that demonstrates network protocols in action—performing live DNS resolution and HTTP/HTTPS browsing, real-time HLS video streaming, and a simulated SMTP email protocol exchange based on an actual session captured during development. Each activity exposes both the **Application Layer** requests and the underlying **Transport Layer** (TCP / UDP) communication.
 
 ## Activities Overview
 
-- **Browsing (Live)**: Performs real DNS resolution (via `dnspython`) and real HTTP/HTTPS requests on the server, generating a live protocol trace of DNS query/response, TCP connection, TLS negotiation, and HTTP headers.
-- **Streaming (Live)**: Performs real HLS video streaming from the Flask server using FFmpeg, capturing live playlist (`.m3u8`) and segment (`.ts`) HTTP requests.
-- **Mail (SMTP Simulation)**: Visualizes a step-by-step SMTP exchange (TCP connect, greeting, EHLO, STARTTLS, AUTH PLAIN, MAIL FROM, RCPT TO, DATA, QUIT) based on an actual successful SMTP session captured during development.
+- **Browsing (Live)**: Performs real DNS resolution (via `dnspython`) and real HTTP/HTTPS requests on the server, generating a live layered protocol trace of DNS queries/responses over UDP datagrams, TCP 3-way handshake, TLS negotiation, HTTP request/response payloads, and TCP connection teardown.
+- **Streaming (Live)**: Performs real HLS video streaming from the Flask server using FFmpeg, capturing live playlist (`.m3u8`) and segment (`.ts`) HTTP requests alongside the underlying TCP transport segments carrying the media payloads.
+- **Mail (SMTP Simulation)**: Visualizes a step-by-step SMTP exchange (greeting, EHLO, STARTTLS, AUTH PLAIN, MAIL FROM, RCPT TO, DATA, QUIT) alongside underlying TCP connection establishment, data push segments, and graceful connection teardown.
   > *Note on Mail:* Outbound SMTP access on ports 25, 465, and 587 is blocked at the platform level on DigitalOcean VPS instances. To maintain the educational demonstration without connection failures or exposing credentials, the Mail visualizer replays a realistic protocol exchange captured during development.
 
 ## Requirements

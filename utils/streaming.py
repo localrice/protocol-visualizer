@@ -22,9 +22,10 @@ class StreamingError(Exception):
     """A safe error raised when local HLS preparation fails."""
 
 
-def _record(event_type: str, message: str, fields: dict[str, str], direction: str) -> None:
+def _record(event_type: str, message: str, fields: dict[str, str], direction: str,
+            protocol: str = "HLS", layer: str = "application") -> None:
     global _next_sequence
-    _stream_events.append(event(_next_sequence, "HLS", direction, event_type, message, fields))
+    _stream_events.append(event(_next_sequence, protocol, direction, event_type, message, fields, delay=650, layer=layer))
     _next_sequence += 1
 
 
@@ -90,8 +91,30 @@ def serve_file(filename: str):
         return None
     resource = f"/stream/{filename}"
     content_type = "application/vnd.apple.mpegurl" if path.suffix == ".m3u8" else "video/mp2t"
-    _record("request", f"GET {resource}", {"Resource": resource, "Content-Type": content_type}, "client-to-server")
-    _record("response", "HTTP/1.1 200 OK", {"Resource": resource, "Content-Type": content_type}, "server-to-client")
+    file_size = path.stat().st_size
+
+    # 1. Application Layer: HLS media request
+    _record("request", f"GET {resource}", {
+        "Resource": resource, "Content-Type": content_type
+    }, "client-to-server", protocol="HLS", layer="application")
+
+    # 2. Transport Layer: Client TCP segment pushing request
+    _record("psh", f"Client → Server [PSH, ACK] TCP Segment ({filename})", {
+        "Transport": "TCP", "Flags": "PSH, ACK", "Source Port": "51420", "Destination Port": "5000",
+        "Resource": resource, "Description": f"TCP segment carrying HLS media request for {filename}"
+    }, "client-to-server", protocol="TCP", layer="transport")
+
+    # 3. Transport Layer: Server TCP segment delivering payload
+    _record("psh", f"Server → Client [PSH, ACK] TCP Segment ({file_size} bytes)", {
+        "Transport": "TCP", "Flags": "PSH, ACK", "Source Port": "5000", "Destination Port": "51420",
+        "Payload Length": f"{file_size} bytes", "Description": f"TCP segment streaming {file_size} bytes to video buffer"
+    }, "server-to-client", protocol="TCP", layer="transport")
+
+    # 4. Application Layer: HTTP 200 OK response
+    _record("response", "HTTP/1.1 200 OK", {
+        "Resource": resource, "Content-Type": content_type, "Size": f"{file_size} bytes"
+    }, "server-to-client", protocol="HLS", layer="application")
+
     return path, content_type
 
 
