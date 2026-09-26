@@ -1,4 +1,4 @@
-const state = { events: [], current: -1, timer: null };
+const state = { events: [], current: -1, timer: null, activity: "browsing", server: "" };
 const streamState = { poll: null, pollStop: null, lastEvent: 0, hls: null };
 const $ = (selector) => document.querySelector(selector);
 
@@ -188,9 +188,208 @@ function groupKeyFor(item) {
   return item.protocol;
 }
 
-function renderExchange() {
-  const view = $("#exchange-view"); view.replaceChildren();
-  if (!state.events.length) { view.innerHTML = '<p class="empty-state">Run an activity to populate the exchange.</p>'; return; }
+function getSequencePhase(item) {
+  if (item.protocol === "TCP") {
+    if (item.type === "syn" || item.type === "syn-ack" || (item.type === "ack" && item.fields?.State === "ESTABLISHED")) {
+      return "TCP Handshake";
+    }
+    if (item.type === "fin-ack" || (item.type === "ack" && (item.fields?.State?.includes("CLOSE") || item.fields?.State?.includes("WAIT")))) {
+      return "TCP Connection Teardown";
+    }
+    return "Application Data";
+  }
+  return "Application Data";
+}
+
+function getSeqCardData(item, isFullLabels = false) {
+  let kind = "";
+  let message = "";
+  const fieldRows = [];
+
+  if (item.protocol === "TCP") {
+    if (item.type === "syn") kind = "SYN";
+    else if (item.type === "syn-ack") kind = "SYN-ACK";
+    else if (item.type === "ack") kind = "ACK";
+    else if (item.type === "fin-ack") kind = "FIN, ACK";
+    else if (item.type === "psh") kind = "TCP DATA";
+    else kind = item.type.toUpperCase();
+
+    const f = item.fields || {};
+    const seq = f["Sequence Number"] !== undefined ? f["Sequence Number"] : f.Seq;
+    const ack = f["Acknowledgment Number"] !== undefined ? f["Acknowledgment Number"] : f.Ack;
+    const len = f.Length;
+    const src = f["Source Port"] !== undefined ? f["Source Port"] : f.Src;
+    const dst = f["Destination Port"] !== undefined ? f["Destination Port"] : f.Dst;
+
+    if (isFullLabels) {
+      if (seq !== undefined) fieldRows.push([["Sequence Number", seq]]);
+      if (ack !== undefined) fieldRows.push([["Acknowledgment Number", ack]]);
+      if (src !== undefined) fieldRows.push([["Source Port", src]]);
+      if (dst !== undefined) fieldRows.push([["Destination Port", dst]]);
+      if (len !== undefined) fieldRows.push([["Length", len]]);
+    } else {
+      const r1 = [];
+      if (seq !== undefined) r1.push(["Seq", seq]);
+      if (ack !== undefined) r1.push(["Ack", ack]);
+      if (r1.length) fieldRows.push(r1);
+
+      if (len !== undefined) {
+        fieldRows.push([["Length", len.includes("bytes") ? len : `${len} bytes`]]);
+      }
+
+      const r2 = [];
+      if (src !== undefined) r2.push(["Src", src]);
+      if (dst !== undefined) r2.push(["Dst", dst]);
+      if (r2.length) fieldRows.push(r2);
+    }
+  } else if (item.protocol === "SMTP") {
+    if (item.type === "command") {
+      kind = "SMTP COMMAND";
+      message = item.message;
+    } else if (item.type === "response") {
+      kind = "SMTP RESPONSE";
+      message = item.message;
+    } else if (item.type === "data") {
+      kind = "SMTP DATA";
+      message = "Email Message Payload";
+      const f = item.fields || {};
+      if (f.To) fieldRows.push([["To", f.To]]);
+      if (f.Subject) fieldRows.push([["Subject", f.Subject]]);
+      if (f.Size) fieldRows.push([["Size", f.Size]]);
+    } else {
+      kind = "SMTP";
+      message = item.message;
+    }
+  } else if (item.protocol === "HLS") {
+    if (item.type === "request") {
+      kind = "HLS REQUEST";
+      message = item.message;
+      if (item.fields?.Resource) {
+        fieldRows.push([["Resource", item.fields.Resource]]);
+      }
+    } else if (item.type === "response") {
+      kind = "HLS RESPONSE";
+      message = item.message;
+      const f = item.fields || {};
+      if (f["Content-Type"]) fieldRows.push([["Content-Type", f["Content-Type"]]]);
+      if (f.Size) fieldRows.push([["Size", f.Size]]);
+    } else {
+      kind = "HLS";
+      message = item.message;
+    }
+  } else if (item.protocol === "HTTP" || item.protocol === "HTTPS") {
+    if (item.type === "request") {
+      kind = `${item.protocol} REQUEST`;
+      message = item.message;
+      if (item.fields?.Host) {
+        fieldRows.push([["Host", item.fields.Host]]);
+      }
+    } else if (item.type === "response") {
+      kind = `${item.protocol} RESPONSE`;
+      message = item.message;
+      const f = item.fields || {};
+      const r = [];
+      if (f["Content-Type"]) {
+        const ct = String(f["Content-Type"]).split(";")[0];
+        r.push(["Content-Type", ct]);
+      }
+      if (f.Size) r.push(["Size", f.Size]);
+      if (r.length) fieldRows.push(r);
+    }
+  } else {
+    kind = item.protocol;
+    message = item.message;
+  }
+
+  return { kind, message, fieldRows };
+}
+
+function renderSequenceDiagram(view, activity) {
+  const container = document.createElement("div");
+  container.className = "seq-container";
+
+  const isFullLabels = activity === "streaming" || activity === "mail";
+  const firstTcp = state.events.find((e) => e.protocol === "TCP");
+  const clientPort = firstTcp?.fields?.["Source Port"] || firstTcp?.fields?.Src || (activity === "browsing" ? "52418" : "54210");
+  const serverPort = firstTcp?.fields?.["Destination Port"] || firstTcp?.fields?.Dst || (activity === "mail" ? "587" : activity === "streaming" ? "5000" : "443");
+  const firstReq = state.events.find((e) => e.protocol === "HTTP" || e.protocol === "HTTPS" || e.protocol === "HLS" || e.protocol === "SMTP");
+
+  let serverDest = state.server;
+  if (!serverDest) {
+    if (activity === "mail") serverDest = `smtp.gmail.com:${serverPort}`;
+    else if (activity === "streaming") serverDest = `127.0.0.1:${serverPort}`;
+    else serverDest = firstReq?.fields?.Host ? `${firstReq.fields.Host}:443` : `Server:${serverPort}`;
+  }
+
+  const header = document.createElement("div");
+  header.className = "seq-header";
+  header.innerHTML = `
+    <div class="seq-node client">
+      <span class="seq-node-badge">CLIENT</span>
+      <span class="seq-node-meta">Port ${escapeHtml(String(clientPort))}</span>
+    </div>
+    <div class="seq-node server">
+      <span class="seq-node-badge">SERVER</span>
+      <span class="seq-node-meta">${escapeHtml(String(serverDest))}</span>
+    </div>
+  `;
+  container.append(header);
+
+  const timeline = document.createElement("div");
+  timeline.className = "seq-timeline";
+
+  let lastPhase = null;
+
+  state.events.forEach((item, index) => {
+    const phase = getSequencePhase(item);
+    if (phase !== lastPhase) {
+      lastPhase = phase;
+      const divider = document.createElement("div");
+      divider.className = "seq-phase-divider";
+      divider.innerHTML = `<span class="seq-phase-title">${escapeHtml(phase)}</span>`;
+      timeline.append(divider);
+    }
+
+    const isClient = item.direction === "client-to-server";
+    const row = document.createElement("div");
+    row.className = `seq-row ${index === state.current ? "is-current" : index < state.current ? "is-complete" : ""}`;
+
+    const { kind, message, fieldRows } = getSeqCardData(item, isFullLabels);
+    const fieldsHtml = fieldRows.map((r) =>
+      `<div class="seq-field-row">${r.map(([k, v]) => `<span class="seq-field"><b>${escapeHtml(k)}:</b> ${escapeHtml(String(v))}</span>`).join("")}</div>`
+    ).join("");
+
+    const cardHtml = `
+      <div class="seq-card-inner">
+        <span class="seq-kind">${escapeHtml(kind)}</span>
+        ${message ? `<strong class="seq-message">${escapeHtml(message)}</strong>` : ""}
+        ${fieldsHtml ? `<div class="seq-fields">${fieldsHtml}</div>` : ""}
+      </div>
+    `;
+
+    row.innerHTML = `
+      <div class="seq-content">
+        ${isClient ? `<div class="seq-card client-side">${cardHtml}</div><div class="seq-spacer"></div>` : `<div class="seq-spacer"></div><div class="seq-card server-side">${cardHtml}</div>`}
+      </div>
+      <div class="seq-arrow-row">
+        <div class="seq-arrow-line">
+          <span class="seq-arrow-origin ${isClient ? "left" : "right"}"></span>
+          <span class="seq-arrow-tip ${isClient ? "right" : "left"}"></span>
+        </div>
+      </div>
+    `;
+
+    timeline.append(row);
+  });
+
+  container.append(timeline);
+  view.append(container);
+
+  const current = view.querySelector(".is-current");
+  if (current) current.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function renderGroupedExchange(view) {
   const groups = [];
   state.events.forEach((item, index) => {
     const key = groupKeyFor(item);
@@ -230,19 +429,100 @@ function renderExchange() {
     section.append(list);
     view.append(section);
   });
-  const current = view.querySelector(".is-current"); if (current) current.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  const current = view.querySelector(".is-current");
+  if (current) current.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
-function showEvent(index) { if (!state.events.length) return; state.current = Math.max(0, Math.min(index, state.events.length - 1)); renderExchange(); scheduleNext(); }
-function escapeHtml(value) { const div = document.createElement("div"); div.textContent = value; return div.innerHTML; }
-function scheduleNext() { clearTimeout(state.timer); if (state.current >= state.events.length - 1) return; state.timer = setTimeout(() => showEvent(state.current + 1), state.events[state.current]?.delay || 800); }
-function loadEvents(data) { clearTimeout(state.timer); state.events = data.events || []; state.current = -1; showEvent(0); }
-async function postJson(url, payload) { const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); const data = await response.json(); if (!response.ok || !data.success) throw new Error(data.error || "Request failed"); return data; }
-function appendStreamEvents(events) { if (!events.length) return; const previousLength = state.events.length; state.events.push(...events); streamState.lastEvent = events[events.length - 1].sequence; if (state.current < 0) showEvent(0); else if (state.current === previousLength - 1) showEvent(previousLength); else renderExchange(); }
-async function pollStreamEvents() { try { const response = await fetch(`/api/stream/events?since=${streamState.lastEvent}`); const data = await response.json(); appendStreamEvents(data.events || []); } catch (_error) { /* Playback can continue if event polling briefly fails. */ } }
-function stopStreamPolling() { clearInterval(streamState.poll); clearTimeout(streamState.pollStop); streamState.poll = null; streamState.pollStop = null; }
-function beginStreamPolling() { stopStreamPolling(); streamState.poll = setInterval(pollStreamEvents, 400); streamState.pollStop = setTimeout(stopStreamPolling, 20000); pollStreamEvents(); }
+
+function renderExchange() {
+  const view = $("#exchange-view");
+  view.replaceChildren();
+  if (!state.events.length) {
+    view.innerHTML = '<p class="empty-state">Run an activity to populate the exchange.</p>';
+    return;
+  }
+  if (state.activity === "browsing" || state.activity === "streaming" || state.activity === "mail") {
+    renderSequenceDiagram(view, state.activity);
+  } else {
+    renderGroupedExchange(view);
+  }
+}
+
+function showEvent(index) {
+  if (!state.events.length) return;
+  state.current = Math.max(0, Math.min(index, state.events.length - 1));
+  renderExchange();
+  scheduleNext();
+}
+
+function escapeHtml(value) {
+  const div = document.createElement("div");
+  div.textContent = value;
+  return div.innerHTML;
+}
+
+function scheduleNext() {
+  clearTimeout(state.timer);
+  if (state.current >= state.events.length - 1) return;
+  state.timer = setTimeout(() => showEvent(state.current + 1), state.events[state.current]?.delay || 800);
+}
+
+function loadEvents(data, activity) {
+  clearTimeout(state.timer);
+  state.activity = activity || data.activity || state.activity || "browsing";
+  state.server = data.server || "";
+  state.events = data.events || [];
+  state.current = -1;
+  showEvent(0);
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.success) throw new Error(data.error || "Request failed");
+  return data;
+}
+
+function appendStreamEvents(events) {
+  if (!events.length) return;
+  const previousLength = state.events.length;
+  state.events.push(...events);
+  streamState.lastEvent = events[events.length - 1].sequence;
+  if (state.current < 0) showEvent(0);
+  else if (state.current === previousLength - 1) showEvent(previousLength);
+  else renderExchange();
+}
+
+async function pollStreamEvents() {
+  try {
+    const response = await fetch(`/api/stream/events?since=${streamState.lastEvent}`);
+    const data = await response.json();
+    appendStreamEvents(data.events || []);
+  } catch (_error) {
+    /* Playback can continue if event polling briefly fails. */
+  }
+}
+
+function stopStreamPolling() {
+  clearInterval(streamState.poll);
+  clearTimeout(streamState.pollStop);
+  streamState.poll = null;
+  streamState.pollStop = null;
+}
+
+function beginStreamPolling() {
+  stopStreamPolling();
+  streamState.poll = setInterval(pollStreamEvents, 400);
+  streamState.pollStop = setTimeout(stopStreamPolling, 20000);
+  pollStreamEvents();
+}
+
 function playHls(url) {
-  const video = $("#stream-player"); video.hidden = false;
+  const video = $("#stream-player");
+  video.hidden = false;
   if (streamState.hls) streamState.hls.destroy();
   if (window.Hls && window.Hls.isSupported()) {
     streamState.hls = new window.Hls();
@@ -257,10 +537,83 @@ function playHls(url) {
   }
 }
 
-$(".activity-tabs").addEventListener("click", (event) => { const tab = event.target.closest(".tab"); if (!tab) return; document.querySelectorAll(".tab").forEach((button) => { const active = button === tab; button.classList.toggle("is-active", active); button.setAttribute("aria-selected", active); }); document.querySelectorAll(".activity-view").forEach((view) => view.classList.toggle("is-hidden", view.dataset.view !== tab.dataset.activity)); showError(); setStatus("Ready for an activity."); });
+$(".activity-tabs").addEventListener("click", (event) => {
+  const tab = event.target.closest(".tab");
+  if (!tab) return;
+  document.querySelectorAll(".tab").forEach((button) => {
+    const active = button === tab;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active);
+  });
+  document.querySelectorAll(".activity-view").forEach((view) => view.classList.toggle("is-hidden", view.dataset.view !== tab.dataset.activity));
+  state.activity = tab.dataset.activity;
+  showError();
+  setStatus("Ready for an activity.");
+});
 
-$("#browse-form").addEventListener("submit", async (event) => { event.preventDefault(); showError(); setStatus("Resolving hostname and requesting URL...", true); try { const data = await postJson("/api/browse", { url: $("#url").value }); loadEvents(data); setStatus("Browse exchange complete."); } catch (error) { setStatus("Browse failed."); showError(error.message); } });
-$("#mail-form").addEventListener("submit", async (event) => { event.preventDefault(); showError(); setStatus("Simulating SMTP exchange...", true); try { const data = await postJson("/api/mail", { to: $("#to").value, subject: $("#subject").value, body: $("#body").value }); loadEvents(data); setStatus("SMTP exchange complete."); } catch (error) { setStatus("Simulation failed."); showError(error.message); } });
-$("#stream-play").addEventListener("click", async () => { showError(); setStatus("Preparing HLS stream...", true); try { const data = await postJson("/api/stream", { quality: "auto" }); clearTimeout(state.timer); state.events = []; state.current = -1; streamState.lastEvent = 0; playHls(data.stream_url); beginStreamPolling(); setStatus("Streaming from the Flask server."); } catch (error) { setStatus("Streaming failed."); showError(error.message); } });
-$("#stream-pause").addEventListener("click", () => { $("#stream-player").pause(); stopStreamPolling(); setStatus("Streaming paused."); });
-$("#stream-player").addEventListener("ended", () => { stopStreamPolling(); setStatus("Streaming complete."); });
+$("#browse-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  showError();
+  setStatus("Resolving hostname and requesting URL...", true);
+  try {
+    const data = await postJson("/api/browse", { url: $("#url").value });
+    loadEvents(data, "browsing");
+    setStatus("Browse exchange complete.");
+  } catch (error) {
+    setStatus("Browse failed.");
+    showError(error.message);
+  }
+});
+
+$("#mail-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  showError();
+  setStatus("Simulating SMTP exchange...", true);
+  try {
+    const data = await postJson("/api/mail", {
+      to: $("#to").value,
+      subject: $("#subject").value,
+      body: $("#body").value,
+    });
+    loadEvents(data, "mail");
+    setStatus("SMTP exchange complete.");
+  } catch (error) {
+    setStatus("Simulation failed.");
+    showError(error.message);
+  }
+});
+
+$("#stream-play").addEventListener("click", async () => {
+  showError();
+  setStatus("Preparing HLS stream...", true);
+  try {
+    const data = await postJson("/api/stream", { quality: "auto" });
+    clearTimeout(state.timer);
+    state.activity = "streaming";
+    state.server = data.server || "";
+    state.events = [];
+    state.current = -1;
+    streamState.lastEvent = 0;
+    playHls(data.stream_url);
+    beginStreamPolling();
+    setStatus("Streaming from the Flask server.");
+  } catch (error) {
+    setStatus("Streaming failed.");
+    showError(error.message);
+  }
+});
+
+$("#stream-pause").addEventListener("click", () => {
+  $("#stream-player").pause();
+  stopStreamPolling();
+  setStatus("Streaming paused.");
+});
+
+$("#stream-player").addEventListener("ended", async () => {
+  try {
+    await postJson("/api/stream/stop", {});
+    await pollStreamEvents();
+  } catch (_e) {}
+  setTimeout(stopStreamPolling, 2500);
+  setStatus("Streaming complete.");
+});
