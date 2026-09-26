@@ -14,15 +14,16 @@ SOURCE_VIDEO = BASE_DIR / "media" / "video.mp4"
 HLS_DIR = BASE_DIR / "instance" / "stream"
 HLS_PLAYLIST = HLS_DIR / "playlist.m3u8"
 _generation_lock = threading.Lock()
-_stream_lock = threading.Lock()
+_stream_lock = threading.RLock()
 _stream_events: deque[dict] = deque(maxlen=200)
 _next_sequence = 1
 _handshake_done = False
 _client_seq = 1
 _server_seq = 1
 
-CLIENT_PORT = "51420"
+CLIENT_PORT = "54210"
 SERVER_PORT = "5000"
+_teardown_done = False
 
 
 class StreamingError(Exception):
@@ -42,10 +43,10 @@ def _record_handshake() -> None:
     _record(
         "syn", "Client → Server",
         {
-            "Seq": "0",
-            "Src": CLIENT_PORT,
-            "Dst": SERVER_PORT,
-            "Window": "65535",
+            "Sequence Number": "0",
+            "Source Port": CLIENT_PORT,
+            "Destination Port": SERVER_PORT,
+            "Window Size": "65535",
         },
         direction="client-to-server",
         protocol="TCP",
@@ -56,11 +57,11 @@ def _record_handshake() -> None:
     _record(
         "syn-ack", "Server → Client",
         {
-            "Seq": "0",
-            "Ack": "1",
-            "Src": SERVER_PORT,
-            "Dst": CLIENT_PORT,
-            "Window": "65535",
+            "Sequence Number": "0",
+            "Acknowledgment Number": "1",
+            "Source Port": SERVER_PORT,
+            "Destination Port": CLIENT_PORT,
+            "Window Size": "65535",
         },
         direction="server-to-client",
         protocol="TCP",
@@ -71,10 +72,10 @@ def _record_handshake() -> None:
     _record(
         "ack", "Client → Server",
         {
-            "Seq": "1",
-            "Ack": "1",
-            "Src": CLIENT_PORT,
-            "Dst": SERVER_PORT,
+            "Sequence Number": "1",
+            "Acknowledgment Number": "1",
+            "Source Port": CLIENT_PORT,
+            "Destination Port": SERVER_PORT,
             "State": "ESTABLISHED",
         },
         direction="client-to-server",
@@ -85,6 +86,76 @@ def _record_handshake() -> None:
     _handshake_done = True
     _client_seq = 1
     _server_seq = 1
+
+
+def record_teardown() -> None:
+    global _client_seq, _server_seq, _teardown_done
+    with _stream_lock:
+        if not _handshake_done or _teardown_done:
+            return
+        _teardown_done = True
+        x = _client_seq
+        y = _server_seq
+
+        # Step 1: Client FIN, ACK (Seq = X, Ack = Y)
+        _record(
+            "fin-ack", "Client → Server",
+            {
+                "Sequence Number": str(x),
+                "Acknowledgment Number": str(y),
+                "Source Port": CLIENT_PORT,
+                "Destination Port": SERVER_PORT,
+                "State": "FIN_WAIT_1",
+            },
+            direction="client-to-server",
+            protocol="TCP",
+            layer="transport",
+        )
+
+        # Step 2: Server ACK (Seq = Y, Ack = X+1)
+        _record(
+            "ack", "Server → Client",
+            {
+                "Sequence Number": str(y),
+                "Acknowledgment Number": str(x + 1),
+                "Source Port": SERVER_PORT,
+                "Destination Port": CLIENT_PORT,
+                "State": "CLOSE_WAIT",
+            },
+            direction="server-to-client",
+            protocol="TCP",
+            layer="transport",
+        )
+
+        # Step 3: Server FIN, ACK (Seq = Y, Ack = X+1)
+        _record(
+            "fin-ack", "Server → Client",
+            {
+                "Sequence Number": str(y),
+                "Acknowledgment Number": str(x + 1),
+                "Source Port": SERVER_PORT,
+                "Destination Port": CLIENT_PORT,
+                "State": "LAST_ACK",
+            },
+            direction="server-to-client",
+            protocol="TCP",
+            layer="transport",
+        )
+
+        # Step 4: Client ACK (Seq = X+1, Ack = Y+1)
+        _record(
+            "ack", "Client → Server",
+            {
+                "Sequence Number": str(x + 1),
+                "Acknowledgment Number": str(y + 1),
+                "Source Port": CLIENT_PORT,
+                "Destination Port": SERVER_PORT,
+                "State": "TIME_WAIT",
+            },
+            direction="client-to-server",
+            protocol="TCP",
+            layer="transport",
+        )
 
 
 def _video_encoder() -> str:
@@ -127,12 +198,13 @@ def ensure_hls() -> None:
 
 
 def start_stream(quality: str = "auto") -> dict:
-    global _next_sequence, _handshake_done, _client_seq, _server_seq
+    global _next_sequence, _handshake_done, _client_seq, _server_seq, _teardown_done
     ensure_hls()
     with _stream_lock:
         _stream_events.clear()
         _next_sequence = 1
         _handshake_done = False
+        _teardown_done = False
         _client_seq = 1
         _server_seq = 1
         _record_handshake()
@@ -167,15 +239,15 @@ def serve_file(filename: str):
 
         # 1. Application Layer: HLS media request
         _record("request", f"GET {resource}", {
-            "Resource": resource, "Content-Type": content_type
+            "Resource": resource,
         }, "client-to-server", protocol="HLS", layer="application")
 
         # 2. Transport Layer: Client TCP segment carrying HTTP request
         _record("psh", "Client → Server", {
-            "Seq": str(cur_client_seq),
-            "Ack": str(cur_server_seq),
-            "Src": CLIENT_PORT,
-            "Dst": SERVER_PORT,
+            "Sequence Number": str(cur_client_seq),
+            "Acknowledgment Number": str(cur_server_seq),
+            "Source Port": CLIENT_PORT,
+            "Destination Port": SERVER_PORT,
             "Length": str(req_len),
         }, "client-to-server", protocol="TCP", layer="transport")
 
@@ -185,20 +257,24 @@ def serve_file(filename: str):
 
         # 3. Application Layer: HTTP 200 OK response
         _record("response", "HTTP/1.1 200 OK", {
-            "Content-Type": content_type, "Size": f"{file_size} bytes"
+            "Content-Type": content_type,
+            "Size": f"{file_size} bytes",
         }, "server-to-client", protocol="HLS", layer="application")
 
         # 4. Transport Layer: Server TCP segment delivering HTTP response
         _record("psh", "Server → Client", {
-            "Seq": str(cur_server_seq),
-            "Ack": str(ack_from_server),
-            "Src": SERVER_PORT,
-            "Dst": CLIENT_PORT,
+            "Sequence Number": str(cur_server_seq),
+            "Acknowledgment Number": str(ack_from_server),
+            "Source Port": SERVER_PORT,
+            "Destination Port": CLIENT_PORT,
             "Length": str(file_size),
         }, "server-to-client", protocol="TCP", layer="transport")
 
         # Server sequence number advances by bytes transmitted
         _server_seq += file_size
+
+        if filename == "segment003.ts":
+            record_teardown()
 
     return path, content_type
 
