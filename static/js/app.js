@@ -28,21 +28,27 @@ function messageLabel(item) {
     response: "Response",
     request: "Request",
     command: "Command",
-    data: "Message data",
+    data: "Message Data",
     connect: "Connection",
-    handshake: "TLS handshake",
-    note: "Encrypted data",
-    syn: "SYN (Handshake)",
+    handshake: "TLS Handshake",
+    note: "Encrypted Data",
+    syn: "SYN",
     "syn-ack": "SYN-ACK",
     ack: "ACK",
-    psh: "PSH-ACK (Data Segment)",
-    "fin-ack": "FIN-ACK (Close)",
-    datagram: "UDP Datagram",
+    psh: "PSH, ACK",
+    "fin-ack": "FIN, ACK",
+    datagram: "UDP",
   };
-  return labels[item.type] || item.type;
+  return labels[item.type] || item.type.toUpperCase();
 }
 
 function displayMessage(item) {
+  if (item.protocol === "TCP") {
+    return item.direction === "client-to-server" ? "Client → Server" : "Server → Client";
+  }
+  if (item.protocol === "UDP") {
+    return item.message || (item.direction === "client-to-server" ? "Client → Server" : "Server → Client");
+  }
   if (item.protocol === "DNS" && item.type === "query") return `A ${item.fields?.Name || "hostname"}`;
   if (item.protocol === "DNS" && item.type === "response") return "NOERROR";
   return item.message;
@@ -51,22 +57,94 @@ function displayMessage(item) {
 function visibleFields(item) {
   const allowed = {
     DNS: item.type === "query" ? ["Name", "Type"] : ["Answer", "Resolver", "Status"],
-    HTTP: item.type === "request" ? ["Host"] : ["Content-Type", "Content-Length", "Server", "Location"],
-    HTTPS: item.type === "request" ? ["Host"] : ["Content-Type", "Content-Length", "Server", "Location"],
+    HTTP: item.type === "request" ? ["Host"] : ["Content-Type", "Size", "Location"],
+    HTTPS: item.type === "request" ? ["Host"] : ["Content-Type", "Size", "Location"],
     SMTP: item.type === "response" ? ["Capabilities"] : [],
     MANIFEST: ["Representation", "Resource"],
     SEGMENT: ["Representation", "Resource"],
-    TCP: ["Destination", "Flags", "Source Port", "Destination Port", "Sequence Number", "Acknowledgment Number", "Payload Length", "Window Size", "State", "Segment", "Description"],
-    UDP: ["Source Port", "Destination Port", "Length", "Checksum", "Description"],
-    TLS: ["Visibility", "Transport"],
+    TCP: ["Seq", "Ack", "Src", "Dst", "Window", "Length"],
+    UDP: ["Src", "Dst", "Length"],
+    TLS: [],
     HLS: item.type === "response" ? ["Content-Type", "Size"] : ["Resource"],
   };
+
+  const alias = {
+    "Sequence Number": "Seq",
+    "Acknowledgment Number": "Ack",
+    "Source Port": "Src",
+    "Destination Port": "Dst",
+    "Window Size": "Window",
+    "Payload Length": "Length",
+    "Content-Length": "Size",
+  };
+
   const keys = allowed[item.protocol] || [];
-  return Object.entries(item.fields || {}).filter(([key]) => keys.includes(key)).map(([key, value]) => {
+  const raw = Object.entries(item.fields || {}).map(([k, v]) => [alias[k] || k, v]);
+
+  return raw.filter(([k]) => keys.includes(k)).map(([key, value]) => {
     if (key === "Answer") return [key, String(value).split(",")[0]];
-    if (key === "Content-Length") return ["Size", `${value} bytes`];
-    return [key, value];
+    if (key === "Length" && typeof value === "string") return [key, value.replace(" bytes", "")];
+    return [key, String(value)];
   });
+}
+
+function visibleFieldRows(item) {
+  const fields = visibleFields(item);
+  if (!fields.length) return [];
+
+  if (item.protocol === "TCP") {
+    const map = new Map(fields);
+    const rows = [];
+    const r1 = [];
+    if (map.has("Seq")) r1.push(["Seq", map.get("Seq")]);
+    if (map.has("Ack")) r1.push(["Ack", map.get("Ack")]);
+    if (r1.length) rows.push(r1);
+
+    const r2 = [];
+    if (map.has("Src")) r2.push(["Src", map.get("Src")]);
+    if (map.has("Dst")) r2.push(["Dst", map.get("Dst")]);
+    if (r2.length) rows.push(r2);
+
+    const r3 = [];
+    if (map.has("Window")) r3.push(["Window", map.get("Window")]);
+    if (map.has("Length")) r3.push(["Length", map.get("Length")]);
+    if (r3.length) rows.push(r3);
+
+    const handled = new Set(["Seq", "Ack", "Src", "Dst", "Window", "Length"]);
+    const remaining = fields.filter(([k]) => !handled.has(k));
+    if (remaining.length) rows.push(remaining);
+    return rows;
+  }
+
+  if (item.protocol === "UDP") {
+    const map = new Map(fields);
+    const rows = [];
+    const r1 = [];
+    if (map.has("Src")) r1.push(["Src", map.get("Src")]);
+    if (map.has("Dst")) r1.push(["Dst", map.get("Dst")]);
+    if (r1.length) rows.push(r1);
+
+    const r2 = [];
+    if (map.has("Length")) r2.push(["Length", map.get("Length")]);
+    if (r2.length) rows.push(r2);
+
+    const handled = new Set(["Src", "Dst", "Length"]);
+    const remaining = fields.filter(([k]) => !handled.has(k));
+    if (remaining.length) rows.push(remaining);
+    return rows;
+  }
+
+  if (fields.length > 1) {
+    const map = new Map(fields);
+    if (map.has("Content-Type") && map.has("Size")) {
+      const rows = [[["Content-Type", map.get("Content-Type")], ["Size", map.get("Size")]]];
+      const rest = fields.filter(([k]) => k !== "Content-Type" && k !== "Size");
+      if (rest.length) rows.push(rest);
+      return rows;
+    }
+  }
+
+  return fields.map((f) => [f]);
 }
 
 function smtpInteractionGroups(items) {
@@ -142,8 +220,11 @@ function renderExchange() {
     group.items.forEach(({ item, index }) => {
       const message = document.createElement("article");
       message.className = `exchange-message ${index === state.current ? "is-current" : index < state.current ? "is-complete" : ""}`;
-      const fields = visibleFields(item).map(([key, value]) => `<span class="field"><b>${escapeHtml(key)}:</b> ${escapeHtml(String(value))}</span>`).join("");
-      message.innerHTML = `<div class="message-side"><span class="message-kind">${escapeHtml(messageLabel(item))}</span><strong>${escapeHtml(displayMessage(item))}</strong>${fields ? `<div class="message-fields">${fields}</div>` : ""}</div>`;
+      const fieldRows = visibleFieldRows(item);
+      const fieldsHtml = fieldRows.map((row) =>
+        `<div class="field-row">${row.map(([key, value]) => `<span class="field"><b>${escapeHtml(key)}:</b> ${escapeHtml(String(value))}</span>`).join("")}</div>`
+      ).join("");
+      message.innerHTML = `<div class="message-side"><span class="message-kind">${escapeHtml(messageLabel(item))}</span><strong>${escapeHtml(displayMessage(item))}</strong>${fieldsHtml ? `<div class="message-fields">${fieldsHtml}</div>` : ""}</div>`;
       list.append(message);
     });
     section.append(list);

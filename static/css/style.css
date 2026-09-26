@@ -81,14 +81,15 @@ button:hover { border-color: var(--accent); color: var(--accent); }
 .exchange-group-title { margin: 0; padding-bottom: 7px; border-bottom: 1px solid var(--line); color: var(--accent); font-size: .68rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
 .exchange-context { margin: 8px 0 2px; color: var(--muted); font-size: .72rem; }
 .exchange-events { display: grid; gap: 2px; }
-.exchange-message { min-height: 62px; padding: 9px 10px; opacity: .38; transition: opacity .35s ease, background .35s ease; }
+.exchange-message { min-height: 48px; padding: 8px 10px; opacity: .38; transition: opacity .35s ease, background .35s ease; }
 .exchange-message.is-complete { opacity: .64; }
 .exchange-message.is-current { opacity: 1; border-radius: 2px; background: var(--soft); }
 .message-side { min-width: 0; }
 .message-kind { display: block; margin-bottom: 2px; color: var(--accent); font-size: .63rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
 .message-side strong { display: block; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .91rem; font-weight: 600; overflow-wrap: anywhere; white-space: pre-line; }
-.message-fields { margin-top: 3px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .7rem; }
-.field { display: block; }
+.message-fields { margin-top: 4px; display: flex; flex-direction: column; gap: 2px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .72rem; }
+.field-row { display: flex; flex-wrap: wrap; gap: 14px; }
+.field { display: inline-flex; gap: 4px; }
 .field b { font-weight: 500; }
 .trace-note { flex: 0 0 auto; margin: 7px 0 0; color: var(--muted); font-size: .68rem; }
 

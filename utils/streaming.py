@@ -99,20 +99,20 @@ def serve_file(filename: str):
     }, "client-to-server", protocol="HLS", layer="application")
 
     # 2. Transport Layer: Client TCP segment pushing request
-    _record("psh", f"Client → Server [PSH, ACK] TCP Segment ({filename})", {
-        "Transport": "TCP", "Flags": "PSH, ACK", "Source Port": "51420", "Destination Port": "5000",
-        "Resource": resource, "Description": f"TCP segment carrying HLS media request for {filename}"
+    _record("psh", "Client → Server", {
+        "Seq": "1", "Ack": "1", "Src": "51420", "Dst": "5000",
+        "Length": str(len(resource)),
     }, "client-to-server", protocol="TCP", layer="transport")
 
     # 3. Transport Layer: Server TCP segment delivering payload
-    _record("psh", f"Server → Client [PSH, ACK] TCP Segment ({file_size} bytes)", {
-        "Transport": "TCP", "Flags": "PSH, ACK", "Source Port": "5000", "Destination Port": "51420",
-        "Payload Length": f"{file_size} bytes", "Description": f"TCP segment streaming {file_size} bytes to video buffer"
+    _record("psh", "Server → Client", {
+        "Seq": "1", "Ack": "1", "Src": "5000", "Dst": "51420",
+        "Length": str(file_size),
     }, "server-to-client", protocol="TCP", layer="transport")
 
     # 4. Application Layer: HTTP 200 OK response
     _record("response", "HTTP/1.1 200 OK", {
-        "Resource": resource, "Content-Type": content_type, "Size": f"{file_size} bytes"
+        "Content-Type": content_type, "Size": f"{file_size} bytes"
     }, "server-to-client", protocol="HLS", layer="application")
 
     return path, content_type
